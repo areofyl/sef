@@ -25,6 +25,11 @@
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
+enum editorMode {
+  MODE_EDIT = 0,
+  MODE_NAV
+};
+
 enum editorKey {
   BACKSPACE = 127,
   ARROW_LEFT = 1000,
@@ -89,6 +94,7 @@ struct editorConfig {
   time_t statusmsg_time;
   struct editorSyntax *syntax;
   struct termios orig_termios;
+  int mode;
 };
 
 struct editorConfig E;
@@ -811,7 +817,8 @@ void editorDrawStatusBar(struct abuf *ab) {
                      E.filename ? E.filename : "[No Name]", E.numrows,
                      E.dirty ? "(modified)" : "");
   int rlen =
-      snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
+      snprintf(rstatus, sizeof(rstatus), "%s | %s | %d/%d",
+               E.mode == MODE_NAV ? "NAV" : "EDIT",
                E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
   if (len > E.screencols)
     len = E.screencols;
@@ -942,13 +949,46 @@ void editorMoveCursor(int key) {
   }
 }
 
+void editorMoveWordForward() {
+  if (E.cy >= E.numrows) return;
+  erow *row = &E.row[E.cy];
+  while (E.cx < row->size && !is_separator(row->chars[E.cx]))
+    E.cx++;
+  while (E.cx < row->size && is_separator(row->chars[E.cx]))
+    E.cx++;
+  if (E.cx >= row->size && E.cy + 1 < E.numrows) {
+    E.cy++;
+    E.cx = 0;
+    row = &E.row[E.cy];
+    while (E.cx < row->size && is_separator(row->chars[E.cx]))
+      E.cx++;
+  }
+}
+
+void editorMoveWordBackward() {
+  if (E.cy >= E.numrows && E.cy > 0) {
+    E.cy--;
+    E.cx = E.row[E.cy].size;
+  }
+  if (E.cy >= E.numrows) return;
+  erow *row = &E.row[E.cy];
+  if (E.cx == 0 && E.cy > 0) {
+    E.cy--;
+    E.cx = E.row[E.cy].size;
+    row = &E.row[E.cy];
+  }
+  while (E.cx > 0 && is_separator(row->chars[E.cx - 1]))
+    E.cx--;
+  while (E.cx > 0 && !is_separator(row->chars[E.cx - 1]))
+    E.cx--;
+}
+
 void editorProcessKeypress() {
   static int quit_times = SEF_QUIT_TIMES;
   int c = editorReadKey();
+
+  // ctrl combos and special keys work in both modes
   switch (c) {
-  case '\r':
-    editorInsertNewline();
-    break;
   case CTRL_KEY('q'):
     if (E.dirty && quit_times > 0) {
       editorSetStatusMessage("WARNING!!! File has unsaved changes. "
@@ -964,22 +1004,16 @@ void editorProcessKeypress() {
   case CTRL_KEY('s'):
     editorSave();
     break;
-  case HOME_KEY:
-    E.cx = 0;
-    break;
-  case END_KEY:
-    if (E.cy < E.numrows)
-      E.cx = E.row[E.cy].size;
-    break;
   case CTRL_KEY('f'):
     editorFind();
     break;
-  case BACKSPACE:
-  case CTRL_KEY('h'):
-  case DEL_KEY:
-    if (c == DEL_KEY)
-      editorMoveCursor(ARROW_RIGHT);
-    editorDelChar();
+  case CTRL_KEY('l'):
+    break;
+  case ARROW_UP:
+  case ARROW_DOWN:
+  case ARROW_LEFT:
+  case ARROW_RIGHT:
+    editorMoveCursor(c);
     break;
   case PAGE_UP:
   case PAGE_DOWN: {
@@ -994,17 +1028,74 @@ void editorProcessKeypress() {
     while (times--)
       editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
   } break;
-  case ARROW_UP:
-  case ARROW_DOWN:
-  case ARROW_LEFT:
-  case ARROW_RIGHT:
-    editorMoveCursor(c);
+  case HOME_KEY:
+    E.cx = 0;
     break;
-  case CTRL_KEY('l'):
+  case END_KEY:
+    if (E.cy < E.numrows)
+      E.cx = E.row[E.cy].size;
+    break;
   case '\x1b':
+    E.mode = MODE_NAV;
+    editorSetStatusMessage("-- NAV --");
     break;
   default:
-    editorInsertChar(c);
+    if (E.mode == MODE_NAV) {
+      switch (c) {
+      case 'e': editorMoveCursor(ARROW_UP); break;
+      case 'd': editorMoveCursor(ARROW_DOWN); break;
+      case 's': editorMoveCursor(ARROW_LEFT); break;
+      case 'f': editorMoveCursor(ARROW_RIGHT); break;
+      case 'w': editorMoveWordBackward(); break;
+      case 'r': editorMoveWordForward(); break;
+      case 'a': E.cx = 0; break;
+      case 'g':
+        if (E.cy < E.numrows)
+          E.cx = E.row[E.cy].size;
+        break;
+      case 'j':
+        editorMoveCursor(ARROW_RIGHT);
+        editorDelChar();
+        break;
+      case 'k':
+        editorSetStatusMessage("paste: not yet implemented");
+        break;
+      case 'l':
+        editorSetStatusMessage("copy: not yet implemented");
+        break;
+      case ';':
+        if (E.cy < E.numrows) {
+          editorDelRow(E.cy);
+          if (E.cy >= E.numrows && E.cy > 0) E.cy--;
+          E.cx = 0;
+        }
+        break;
+      case 'v':
+        editorSetStatusMessage("visual: not yet implemented");
+        break;
+      case ' ':
+        E.mode = MODE_EDIT;
+        editorSetStatusMessage("-- EDIT --");
+        break;
+      }
+    } else {
+      switch (c) {
+      case '\r':
+        editorInsertNewline();
+        break;
+      case BACKSPACE:
+      case CTRL_KEY('h'):
+        editorDelChar();
+        break;
+      case DEL_KEY:
+        editorMoveCursor(ARROW_RIGHT);
+        editorDelChar();
+        break;
+      default:
+        editorInsertChar(c);
+        break;
+      }
+    }
     break;
   }
 
@@ -1025,6 +1116,7 @@ void initEditor() {
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
   E.syntax = NULL;
+  E.mode = MODE_EDIT;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)
     die("getWindowSize");
@@ -1037,7 +1129,7 @@ int main(int argc, char *argv[]) {
   if (argc >= 2) {
     editorOpen(argv[1]);
   }
-  editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+  editorSetStatusMessage("EDIT mode | ESC=NAV Space=EDIT | Ctrl-S=save Ctrl-Q=quit Ctrl-F=find");
   while (1) {
     editorRefreshScreen();
     editorProcessKeypress();
