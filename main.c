@@ -30,6 +30,24 @@ enum editorMode {
   MODE_NAV
 };
 
+enum undoType {
+  UNDO_INSERT_CHAR,
+  UNDO_DELETE_CHAR,
+  UNDO_SPLIT_LINE,
+  UNDO_JOIN_LINES,
+  UNDO_DELETE_ROW
+};
+
+#define UNDO_MAX 1000
+
+struct undoOp {
+  int type;
+  int cx, cy;
+  int c;
+  char *str;
+  int len;
+};
+
 enum editorKey {
   BACKSPACE = 127,
   ARROW_LEFT = 1000,
@@ -95,6 +113,12 @@ struct editorConfig {
   struct editorSyntax *syntax;
   struct termios orig_termios;
   int mode;
+  char *clipboard;
+  int clipboard_len;
+  int visual;
+  int vx, vy;
+  struct undoOp undo_stack[UNDO_MAX];
+  int undo_len;
 };
 
 struct editorConfig E;
@@ -121,6 +145,28 @@ struct editorSyntax HLDB[] = {
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
+
+void undoPush(int type, int cx, int cy, int c, char *str, int len) {
+  if (E.undo_len >= UNDO_MAX) {
+    if (E.undo_stack[0].str) free(E.undo_stack[0].str);
+    memmove(&E.undo_stack[0], &E.undo_stack[1],
+            sizeof(struct undoOp) * (UNDO_MAX - 1));
+    E.undo_len = UNDO_MAX - 1;
+  }
+  struct undoOp *op = &E.undo_stack[E.undo_len++];
+  op->type = type;
+  op->cx = cx;
+  op->cy = cy;
+  op->c = c;
+  if (str && len > 0) {
+    op->str = malloc(len + 1);
+    memcpy(op->str, str, len);
+    op->str[len] = '\0';
+  } else {
+    op->str = NULL;
+  }
+  op->len = len;
+}
 
 // terminal
 
@@ -532,10 +578,14 @@ void editorDelChar() {
     return;
   erow *row = &E.row[E.cy];
   if (E.cx > 0) {
+    int c = row->chars[E.cx - 1];
+    undoPush(UNDO_DELETE_CHAR, E.cx - 1, E.cy, c, NULL, 0);
     editorRowDelChar(row, E.cx - 1);
     E.cx--;
   } else {
-    E.cx = E.row[E.cy - 1].size;
+    int prev_size = E.row[E.cy - 1].size;
+    undoPush(UNDO_JOIN_LINES, prev_size, E.cy - 1, 0, NULL, 0);
+    E.cx = prev_size;
     editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
     editorDelRow(E.cy);
     E.cy--;
@@ -549,10 +599,12 @@ void editorInsertChar(int c) {
     editorInsertRow(E.numrows, "", 0);
   }
   editorRowInsertChar(&E.row[E.cy], E.cx, c);
+  undoPush(UNDO_INSERT_CHAR, E.cx, E.cy, c, NULL, 0);
   E.cx++;
 }
 
 void editorInsertNewline() {
+  undoPush(UNDO_SPLIT_LINE, E.cx, E.cy, 0, NULL, 0);
   if (E.cx == 0) {
     editorInsertRow(E.cy, "", 0);
   } else {
@@ -565,6 +617,162 @@ void editorInsertNewline() {
   }
   E.cy++;
   E.cx = 0;
+}
+
+// undo
+
+void editorUndo() {
+  if (E.undo_len == 0) {
+    editorSetStatusMessage("nothing to undo");
+    return;
+  }
+  E.undo_len--;
+  struct undoOp *op = &E.undo_stack[E.undo_len];
+  switch (op->type) {
+  case UNDO_INSERT_CHAR:
+    editorRowDelChar(&E.row[op->cy], op->cx);
+    E.cx = op->cx;
+    E.cy = op->cy;
+    break;
+  case UNDO_DELETE_CHAR:
+    editorRowInsertChar(&E.row[op->cy], op->cx, op->c);
+    E.cx = op->cx + 1;
+    E.cy = op->cy;
+    break;
+  case UNDO_SPLIT_LINE:
+    editorRowAppendString(&E.row[op->cy],
+                          E.row[op->cy + 1].chars,
+                          E.row[op->cy + 1].size);
+    editorDelRow(op->cy + 1);
+    E.cx = op->cx;
+    E.cy = op->cy;
+    break;
+  case UNDO_JOIN_LINES: {
+    erow *row = &E.row[op->cy];
+    editorInsertRow(op->cy + 1, &row->chars[op->cx], row->size - op->cx);
+    row = &E.row[op->cy];
+    row->size = op->cx;
+    row->chars[row->size] = '\0';
+    editorUpdateRow(row);
+    E.cx = 0;
+    E.cy = op->cy + 1;
+    break;
+  }
+  case UNDO_DELETE_ROW:
+    editorInsertRow(op->cy, op->str, op->len);
+    E.cx = 0;
+    E.cy = op->cy;
+    free(op->str);
+    op->str = NULL;
+    break;
+  }
+}
+
+// clipboard
+
+void editorCopyLine() {
+  if (E.cy >= E.numrows) return;
+  free(E.clipboard);
+  erow *row = &E.row[E.cy];
+  E.clipboard = malloc(row->size + 1);
+  memcpy(E.clipboard, row->chars, row->size);
+  E.clipboard[row->size] = '\0';
+  E.clipboard_len = row->size;
+  editorSetStatusMessage("copied line");
+}
+
+void editorPaste() {
+  if (!E.clipboard) {
+    editorSetStatusMessage("nothing to paste");
+    return;
+  }
+  editorInsertRow(E.cy + 1, E.clipboard, E.clipboard_len);
+  E.cy++;
+  E.cx = 0;
+  editorSetStatusMessage("pasted line");
+}
+
+// visual mode helpers
+
+int editorInSelection(int row, int col) {
+  if (!E.visual) return 0;
+  int sy = E.vy, sx = E.vx, ey = E.cy, ex = E.cx;
+  if (sy > ey || (sy == ey && sx > ex)) {
+    int ty = sy, tx = sx;
+    sy = ey; sx = ex;
+    ey = ty; ex = tx;
+  }
+  if (row < sy || row > ey) return 0;
+  if (row == sy && row == ey) return col >= sx && col < ex;
+  if (row == sy) return col >= sx;
+  if (row == ey) return col < ex;
+  return 1;
+}
+
+void editorDeleteSelection() {
+  int sy = E.vy, sx = E.vx, ey = E.cy, ex = E.cx;
+  if (sy > ey || (sy == ey && sx > ex)) {
+    int ty = sy, tx = sx;
+    sy = ey; sx = ex;
+    ey = ty; ex = tx;
+  }
+  E.cy = sy;
+  E.cx = sx;
+  if (sy == ey) {
+    for (int i = 0; i < ex - sx; i++)
+      editorRowDelChar(&E.row[sy], sx);
+  } else {
+    E.row[sy].size = sx;
+    E.row[sy].chars[sx] = '\0';
+    editorUpdateRow(&E.row[sy]);
+    for (int i = sy + 1; i < ey; i++) {
+      editorDelRow(sy + 1);
+    }
+    editorRowAppendString(&E.row[sy], &E.row[sy + 1].chars[ex],
+                          E.row[sy + 1].size - ex);
+    editorDelRow(sy + 1);
+  }
+  E.visual = 0;
+  E.dirty++;
+}
+
+void editorCopySelection() {
+  int sy = E.vy, sx = E.vx, ey = E.cy, ex = E.cx;
+  if (sy > ey || (sy == ey && sx > ex)) {
+    int ty = sy, tx = sx;
+    sy = ey; sx = ex;
+    ey = ty; ex = tx;
+  }
+  free(E.clipboard);
+  if (sy == ey) {
+    int len = ex - sx;
+    E.clipboard = malloc(len + 1);
+    memcpy(E.clipboard, &E.row[sy].chars[sx], len);
+    E.clipboard[len] = '\0';
+    E.clipboard_len = len;
+  } else {
+    int totlen = 0;
+    totlen += E.row[sy].size - sx + 1;
+    for (int i = sy + 1; i < ey; i++)
+      totlen += E.row[i].size + 1;
+    totlen += ex;
+    E.clipboard = malloc(totlen + 1);
+    char *p = E.clipboard;
+    memcpy(p, &E.row[sy].chars[sx], E.row[sy].size - sx);
+    p += E.row[sy].size - sx;
+    *p++ = '\n';
+    for (int i = sy + 1; i < ey; i++) {
+      memcpy(p, E.row[i].chars, E.row[i].size);
+      p += E.row[i].size;
+      *p++ = '\n';
+    }
+    memcpy(p, E.row[ey].chars, ex);
+    p += ex;
+    *p = '\0';
+    E.clipboard_len = totlen;
+  }
+  E.visual = 0;
+  editorSetStatusMessage("copied selection");
 }
 
 // file i/o
@@ -775,17 +983,29 @@ void editorDrawRows(struct abuf *ab) {
       unsigned char *hl = &E.row[filerow].hl[E.coloff];
       int current_color = -1;
       int j;
+      int in_sel = 0;
       for (j = 0; j < len; j++) {
+        int sel = editorInSelection(filerow, E.coloff + j);
+        if (sel && !in_sel) {
+          abAppend(ab, "\x1b[7m", 4);
+          in_sel = 1;
+        } else if (!sel && in_sel) {
+          abAppend(ab, "\x1b[m", 3);
+          in_sel = 0;
+          current_color = -1;
+        }
         if (iscntrl(c[j])) {
           char sym = (c[j] <= 26) ? '@' + c[j] : '?';
-          abAppend(ab, "\x1b[7m", 4);
+          if (!in_sel) abAppend(ab, "\x1b[7m", 4);
           abAppend(ab, &sym, 1);
-          abAppend(ab, "\x1b[m", 3);
-          if (current_color != -1) {
+          if (!in_sel) abAppend(ab, "\x1b[m", 3);
+          if (!in_sel && current_color != -1) {
             char buf[16];
             int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
             abAppend(ab, buf, clen);
           }
+        } else if (in_sel) {
+          abAppend(ab, &c[j], 1);
         } else if (hl[j] == HL_NORMAL) {
           if (current_color != -1) {
             abAppend(ab, "\x1b[39m", 5);
@@ -803,6 +1023,7 @@ void editorDrawRows(struct abuf *ab) {
           abAppend(ab, &c[j], 1);
         }
       }
+      if (in_sel) abAppend(ab, "\x1b[m", 3);
       abAppend(ab, "\x1b[39m", 5);
     }
     abAppend(ab, "\x1b[K", 3);
@@ -818,7 +1039,7 @@ void editorDrawStatusBar(struct abuf *ab) {
                      E.dirty ? "(modified)" : "");
   int rlen =
       snprintf(rstatus, sizeof(rstatus), "%s | %s | %d/%d",
-               E.mode == MODE_NAV ? "NAV" : "EDIT",
+               E.visual ? "VISUAL" : E.mode == MODE_NAV ? "NAV" : "EDIT",
                E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
   if (len > E.screencols)
     len = E.screencols;
@@ -1036,6 +1257,7 @@ void editorProcessKeypress() {
       E.cx = E.row[E.cy].size;
     break;
   case '\x1b':
+    E.visual = 0;
     E.mode = MODE_NAV;
     editorSetStatusMessage("-- NAV --");
     break;
@@ -1054,26 +1276,70 @@ void editorProcessKeypress() {
           E.cx = E.row[E.cy].size;
         break;
       case 'j':
-        editorMoveCursor(ARROW_RIGHT);
-        editorDelChar();
+        if (E.visual) {
+          editorDeleteSelection();
+          editorSetStatusMessage("deleted selection");
+        } else {
+          editorMoveCursor(ARROW_RIGHT);
+          editorDelChar();
+        }
         break;
       case 'k':
-        editorSetStatusMessage("paste: not yet implemented");
+        editorPaste();
         break;
       case 'l':
-        editorSetStatusMessage("copy: not yet implemented");
+        if (E.visual) {
+          editorCopySelection();
+        } else {
+          editorCopyLine();
+        }
         break;
       case ';':
-        if (E.cy < E.numrows) {
+        if (E.visual) {
+          editorDeleteSelection();
+          editorSetStatusMessage("deleted selection");
+        } else if (E.cy < E.numrows) {
+          undoPush(UNDO_DELETE_ROW, 0, E.cy, 0,
+                   E.row[E.cy].chars, E.row[E.cy].size);
           editorDelRow(E.cy);
           if (E.cy >= E.numrows && E.cy > 0) E.cy--;
           E.cx = 0;
         }
         break;
       case 'v':
-        editorSetStatusMessage("visual: not yet implemented");
+        if (E.visual) {
+          E.visual = 0;
+          editorSetStatusMessage("-- NAV --");
+        } else {
+          E.visual = 1;
+          E.vx = E.cx;
+          E.vy = E.cy;
+          editorSetStatusMessage("-- VISUAL --");
+        }
+        break;
+      case 'u':
+        editorUndo();
+        break;
+      case 'q':
+        if (E.dirty && quit_times > 0) {
+          editorSetStatusMessage("WARNING!!! File has unsaved changes. "
+                                 "Press q %d more times to quit.",
+                                 quit_times);
+          quit_times--;
+          return;
+        }
+        write(STDOUT_FILENO, "\x1b[2J", 4);
+        write(STDOUT_FILENO, "\x1b[H", 3);
+        exit(0);
+        break;
+      case 'x':
+        editorSave();
+        break;
+      case '/':
+        editorFind();
         break;
       case ' ':
+        E.visual = 0;
         E.mode = MODE_EDIT;
         editorSetStatusMessage("-- EDIT --");
         break;
@@ -1117,6 +1383,12 @@ void initEditor() {
   E.statusmsg_time = 0;
   E.syntax = NULL;
   E.mode = MODE_EDIT;
+  E.clipboard = NULL;
+  E.clipboard_len = 0;
+  E.visual = 0;
+  E.vx = 0;
+  E.vy = 0;
+  E.undo_len = 0;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)
     die("getWindowSize");
